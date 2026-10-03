@@ -92,36 +92,68 @@ class _LyricViewState extends State<LyricView>
                 });
               }
               if (layout == null) return const SizedBox.shrink();
-              Widget result = buildLineSwitch((context, switchState) {
-                return buildActiveHighlightWidth((double value) {
-                  return ValueListenableBuilder(
-                      valueListenable: scrollYNotifier,
-                      builder: (context, double scrollY, child) {
-                        return CustomPaint(
-                          painter: LyricPainter(
-                            layout: layout!,
-                            onShowLineRectsChange: (rects) {
-                              showLineRects = rects;
-                            },
-                            style: style,
-                            playIndex: controller.activeIndexNotifiter.value,
-                            activeHighlightWidth: value,
-                            isSelecting: controller.isSelectingNotifier.value,
-                            scrollY: scrollY,
-                            onAnchorIndexChange: (index) {
-                              scheduleMicrotask(() {
-                                controller.selectedIndexNotifier.value = index;
-                              });
-                            },
-                            switchState: switchState,
-                          ),
-                          size: lyricSize,
+              // 文字层与高亮层分离：
+              // - 文字层只在滚动 / 切行 / 选中变化时重绘；
+              // - 高亮层随播放进度逐帧重绘，但只绘制当前行的高亮。
+              // 两层各自包在 RepaintBoundary 中，避免互相触发重绘；
+              // 上下渐隐由 painter 在内部离屏图层里用 dstOut 实现。
+              return buildLineSwitch((context, switchState) {
+                return Stack(
+                  clipBehavior: Clip.none,
+                  fit: StackFit.expand,
+                  children: [
+                    RepaintBoundary(
+                      child: ValueListenableBuilder<double>(
+                        valueListenable: scrollYNotifier,
+                        builder: (context, scrollY, child) {
+                          return CustomPaint(
+                            painter: LyricPainter(
+                              layout: layout!,
+                              playIndex: controller.activeIndexNotifiter.value,
+                              isSelecting:
+                                  controller.isSelectingNotifier.value,
+                              scrollY: scrollY,
+                              switchState: switchState,
+                              onShowLineRectsChange: (rects) {
+                                showLineRects = rects;
+                              },
+                              onAnchorIndexChange: (index) {
+                                scheduleMicrotask(() {
+                                  controller.selectedIndexNotifier.value =
+                                      index;
+                                });
+                              },
+                              style: style,
+                            ),
+                            size: lyricSize,
+                          );
+                        },
+                      ),
+                    ),
+                    RepaintBoundary(
+                      child: buildActiveHighlightWidth((value) {
+                        return ValueListenableBuilder<double>(
+                          valueListenable: scrollYNotifier,
+                          builder: (context, scrollY, child) {
+                            return CustomPaint(
+                              painter: LyricHighlightPainter(
+                                layout: layout!,
+                                playIndex:
+                                    controller.activeIndexNotifiter.value,
+                                scrollY: scrollY,
+                                switchState: switchState,
+                                style: style,
+                                activeHighlightWidth: value,
+                              ),
+                              size: lyricSize,
+                            );
+                          },
                         );
-                      });
-                });
+                      }),
+                    ),
+                  ],
+                );
               });
-              result = wrapMaskIfNeed(result);
-              return result;
             },
           ),
         ),

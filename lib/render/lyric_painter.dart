@@ -15,90 +15,109 @@ class _HighlightSegment {
   _HighlightSegment(this.rect, this.shader);
 }
 
-class LyricPainter extends CustomPainter {
+/// 顶部/底部渐隐带（屏幕坐标）。
+class _FadeBand {
+  final Rect rect;
+  final Gradient gradient;
+
+  const _FadeBand(this.rect, this.gradient);
+}
+
+/// 歌词绘制基类：集中处理布局、行切换动画、边缘渐变遮罩等公共逻辑。
+///
+/// 绘制被拆成两层（见 [LyricPainter] 与 [LyricHighlightPainter]）：
+/// 播放时每帧变化的逐字高亮只重绘高亮层，不再连带整屏文字一起重绘。
+abstract class _LyricPainterBase extends CustomPainter {
   final LyricLayout layout;
   final int playIndex;
   final double scrollY;
-  final double activeHighlightWidth;
   final LyricLineSwitchState switchState;
-  final bool isSelecting;
   final LyricStyle style;
-  final void Function(int) onAnchorIndexChange;
-  final void Function(Map<int, Rect>) onShowLineRectsChange;
 
-  LyricPainter({
+  _LyricPainterBase({
     required this.layout,
     required this.playIndex,
     required this.scrollY,
-    required this.onAnchorIndexChange,
-    required this.activeHighlightWidth,
     required this.switchState,
-    required this.isSelecting,
-    required this.onShowLineRectsChange,
     required this.style,
   });
 
-  @override
-  void paint(Canvas canvas, Size size) {
-    final layoutStyle = layout.style;
-    final lineGap = layoutStyle.lineGap;
+  /// 第 [index] 行顶部的 Y 坐标（与 [LyricPainter.paint] 中逐行累加逻辑一致）。
+  double lineTopY(int index) {
     final metrics = layout.metrics;
-
-    if (!_debugLyric) {
-      canvas.clipRect(Rect.fromLTRB(-layoutStyle.contentPadding.left, 0,
-          size.width + layoutStyle.contentPadding.right, size.height));
+    var y = -scrollY;
+    for (var i = 0; i < index && i < metrics.length; i++) {
+      y += layout.getLineHeight(i == playIndex, i) + layout.style.lineGap;
     }
+    return y;
+  }
 
-    final selectionPosition = layout.selectionAnchorPosition;
-    if (_debugLyric) {
-      final activePosition = layout.activeAnchorPosition;
-      final debugPaint = Paint()..color = layoutStyle.selectedColor;
-      canvas.drawLine(
-        Offset(0, selectionPosition),
-        Offset(size.width, selectionPosition),
-        debugPaint,
-      );
-      canvas.drawLine(
-        Offset(0, activePosition),
-        Offset(size.width, activePosition),
-        debugPaint,
-      );
-    }
-    var totalTranslateY = -scrollY;
-    canvas.translate(0, -scrollY);
-    var selectedIndex = -1;
-    final showLineRects = <int, Rect>{};
-    final halfLineGap = lineGap / 2;
-    final contentHorizontal = layoutStyle.contentPadding.horizontal;
-    final activeLineOnly = style.activeLineOnly;
+  /// 是否启用上下渐隐。
+  bool get hasEdgeFade {
+    final fadeRange = style.fadeRange;
+    return fadeRange != null && (fadeRange.top > 0 || fadeRange.bottom > 0);
+  }
 
-    for (var i = 0; i < metrics.length; i++) {
-      final isActive = i == playIndex;
-      final lineHeight = layout.getLineHeight(isActive, i);
-      totalTranslateY += lineHeight;
-      if ((totalTranslateY + halfLineGap) >= selectionPosition &&
-          selectedIndex == -1) {
-        selectedIndex = i;
-        onAnchorIndexChange(i);
-      }
-      if (totalTranslateY - lineHeight >= size.height) {
-        break;
-      }
-      if (totalTranslateY > 0) {
-        showLineRects[i] = Rect.fromLTWH(0, totalTranslateY - lineHeight,
-            size.width + contentHorizontal, lineHeight);
-        if (!activeLineOnly || isActive) {
-          drawLine(canvas, metrics[i], size, i, selectedIndex == i);
-        }
-      }
-      totalTranslateY += lineGap;
-      if (_debugLyric) {
-        canvas.drawRect(Rect.fromLTWH(0, 0, size.width, lineHeight),
-            Paint()..color = Colors.purple.withAlpha(50));
-      }
-      canvas.translate(0, lineHeight + lineGap);
+  /// 顶部/底部渐隐带（屏幕坐标）。
+  List<_FadeBand> edgeFadeBands(Size size) {
+    final fadeRange = style.fadeRange;
+    if (fadeRange == null) return const [];
+    var top = fadeRange.top;
+    var bottom = fadeRange.bottom;
+    if (top <= 0 && bottom <= 0) return const [];
+    if (top > 1) top = top / size.height;
+    if (bottom > 1) bottom = bottom / size.height;
+    top = top.clamp(0.0, 1.0);
+    bottom = bottom.clamp(0.0, 1.0);
+    final bands = <_FadeBand>[];
+    if (top > 0) {
+      final rect = Rect.fromLTWH(0, 0, size.width, size.height * top);
+      bands.add(_FadeBand(
+        rect,
+        const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Colors.black, Colors.transparent],
+        ),
+      ));
     }
-    onShowLineRectsChange(showLineRects);
+    if (bottom > 0) {
+      final rect = Rect.fromLTWH(
+          0, size.height * (1 - bottom), size.width, size.height * bottom);
+      bands.add(_FadeBand(
+        rect,
+        const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Colors.transparent, Colors.black],
+        ),
+      ));
+    }
+    return bands;
+  }
+
+  /// [rect]（屏幕坐标）是否与渐隐带相交。
+  bool intersectsEdgeFade(Rect rect, Size size) {
+    for (final band in edgeFadeBands(size)) {
+      if (band.rect.overlaps(rect)) return true;
+    }
+    return false;
+  }
+
+  /// 只对顶部/底部渐变区域做 dstOut 遮罩，替代整屏 ShaderMask 的 saveLayer。
+  ///
+  /// 必须在“屏幕坐标”下、且在真实的离屏图层内调用：
+  /// - 屏幕坐标：调用前先 restore 掉内容绘制时的 translate，否则渐变会落到错误位置；
+  /// - 离屏图层：dstOut 会擦除目标图层内容，仅靠 RepaintBoundary 不够（它只是
+  ///   重绘边界，不会创建离屏层），否则会擦到下层背景形成灰色渐变带。
+  void paintEdgeFade(Canvas canvas, Size size) {
+    final bands = edgeFadeBands(size);
+    if (bands.isEmpty) return;
+    final paint = Paint()..blendMode = BlendMode.dstOut;
+    for (final band in bands) {
+      paint.shader = band.gradient.createShader(band.rect);
+      canvas.drawRect(band.rect, paint);
+    }
   }
 
   void drawHighlight(
@@ -290,6 +309,130 @@ class LyricPainter extends CustomPainter {
     return 0;
   }
 
+  double calcContentAliginOffset(double contentWidth, double containerWidth) {
+    switch (layout.style.contentAlignment) {
+      case CrossAxisAlignment.start:
+        return 0;
+      case CrossAxisAlignment.end:
+        return containerWidth - contentWidth;
+      case CrossAxisAlignment.center:
+        return (containerWidth - contentWidth) / 2;
+      default:
+        return 0;
+    }
+  }
+
+  bool shouldRepaintCommon(covariant _LyricPainterBase oldDelegate) {
+    return layout != oldDelegate.layout ||
+        playIndex != oldDelegate.playIndex ||
+        scrollY != oldDelegate.scrollY ||
+        switchState != oldDelegate.switchState;
+  }
+}
+
+/// 歌词文字层：绘制普通文字、翻译与行切换动画，不绘制逐字高亮。
+///
+/// 只在滚动 / 切行 / 选中状态变化时重绘，播放进度不会触发这一层。
+class LyricPainter extends _LyricPainterBase {
+  final bool isSelecting;
+  final void Function(int) onAnchorIndexChange;
+  final void Function(Map<int, Rect>) onShowLineRectsChange;
+
+  LyricPainter({
+    required LyricLayout layout,
+    required int playIndex,
+    required double scrollY,
+    required LyricLineSwitchState switchState,
+    required this.isSelecting,
+    required this.onAnchorIndexChange,
+    required this.onShowLineRectsChange,
+    required LyricStyle style,
+  }) : super(
+          layout: layout,
+          playIndex: playIndex,
+          scrollY: scrollY,
+          switchState: switchState,
+          style: style,
+        );
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final layoutStyle = layout.style;
+    final lineGap = layoutStyle.lineGap;
+    final metrics = layout.metrics;
+
+    // 上下渐隐依赖 dstOut 擦除，必须在离屏图层内进行，否则会擦到下层背景；
+    // 仅在启用渐隐时创建。文字层只在滚动 / 切行时重绘，
+    // 播放中的逐字高亮不会触发这里的 saveLayer。
+    final needsFadeLayer = hasEdgeFade;
+    if (!_debugLyric) {
+      canvas.clipRect(Rect.fromLTRB(-layoutStyle.contentPadding.left, 0,
+          size.width + layoutStyle.contentPadding.right, size.height));
+    }
+    if (needsFadeLayer) {
+      canvas.saveLayer(Offset.zero & size, Paint());
+    }
+    // 内容在带位移的画布上绘制，restore 后回到屏幕坐标再做渐隐，
+    // 避免 dstOut 渐变被内容位移影响而擦到错误位置。
+    canvas.save();
+
+    final selectionPosition = layout.selectionAnchorPosition;
+    if (_debugLyric) {
+      final activePosition = layout.activeAnchorPosition;
+      final debugPaint = Paint()..color = layoutStyle.selectedColor;
+      canvas.drawLine(
+        Offset(0, selectionPosition),
+        Offset(size.width, selectionPosition),
+        debugPaint,
+      );
+      canvas.drawLine(
+        Offset(0, activePosition),
+        Offset(size.width, activePosition),
+        debugPaint,
+      );
+    }
+    var totalTranslateY = -scrollY;
+    canvas.translate(0, -scrollY);
+    var selectedIndex = -1;
+    final showLineRects = <int, Rect>{};
+    final halfLineGap = lineGap / 2;
+    final contentHorizontal = layoutStyle.contentPadding.horizontal;
+    final activeLineOnly = style.activeLineOnly;
+
+    for (var i = 0; i < metrics.length; i++) {
+      final isActive = i == playIndex;
+      final lineHeight = layout.getLineHeight(isActive, i);
+      totalTranslateY += lineHeight;
+      if ((totalTranslateY + halfLineGap) >= selectionPosition &&
+          selectedIndex == -1) {
+        selectedIndex = i;
+        onAnchorIndexChange(i);
+      }
+      if (totalTranslateY - lineHeight >= size.height) {
+        break;
+      }
+      if (totalTranslateY > 0) {
+        showLineRects[i] = Rect.fromLTWH(0, totalTranslateY - lineHeight,
+            size.width + contentHorizontal, lineHeight);
+        if (!activeLineOnly || isActive) {
+          drawLine(canvas, metrics[i], size, i, selectedIndex == i);
+        }
+      }
+      totalTranslateY += lineGap;
+      if (_debugLyric) {
+        canvas.drawRect(Rect.fromLTWH(0, 0, size.width, lineHeight),
+            Paint()..color = Colors.purple.withAlpha(50));
+      }
+      canvas.translate(0, lineHeight + lineGap);
+    }
+    onShowLineRectsChange(showLineRects);
+    canvas.restore();
+    paintEdgeFade(canvas, size);
+    if (needsFadeLayer) {
+      canvas.restore();
+    }
+  }
+
   Color _resolveColor(TextStyle baseStyle, Color selectColor, bool isSelecting,
       bool isInAnchorArea, Color? customColor) {
     if (isSelecting && isInAnchorArea) return selectColor;
@@ -309,7 +452,6 @@ class LyricPainter extends CustomPainter {
     final painter = isActive ? metric.activeTextPainter : metric.textPainter;
     final oldSpan = painter.text! as TextSpan;
 
-    double highlightOpacity = 1.0;
     Color? animatedMainColor;
     if (style.enableSwitchAnimation) {
       final normalColor = layoutStyle.textStyle.color;
@@ -318,11 +460,9 @@ class LyricPainter extends CustomPainter {
       if (index == switchState.enterIndex) {
         animatedMainColor = Color.lerp(
             normalColor, activeColor, switchState.enterAnimationValue);
-        highlightOpacity = switchState.enterAnimationValue;
       } else if (index == switchState.exitIndex) {
         animatedMainColor = Color.lerp(
             activeColor, normalColor, switchState.exitAnimationValue);
-        highlightOpacity = 1.0 - switchState.exitAnimationValue;
       }
     }
 
@@ -351,20 +491,6 @@ class LyricPainter extends CustomPainter {
     painter.paint(canvas, Offset.zero);
     if (needsRestyle) {
       painter.text = oldSpan;
-    }
-    if (isActive) {
-      drawHighlight(
-          canvas, size, metric.activeMaskPainter, metric.activeMetrics,
-          highlightTotalWidth: metric.words?.isNotEmpty == true
-              ? activeHighlightWidth
-              : double.infinity,
-          animationOpacity: highlightOpacity);
-    } else if (index == switchState.exitIndex &&
-        switchState.exitAnimationValue < 1 &&
-        style.enableSwitchAnimation) {
-      drawHighlight(canvas, size, metric.textMaskPainter, metric.metrics,
-          highlightTotalWidth: double.infinity,
-          animationOpacity: highlightOpacity);
     }
     canvas.restore();
     final mainHeight = isActive ? metric.activeHeight : metric.height;
@@ -424,26 +550,149 @@ class LyricPainter extends CustomPainter {
     }
   }
 
-  double calcContentAliginOffset(double contentWidth, double containerWidth) {
-    switch (layout.style.contentAlignment) {
-      case CrossAxisAlignment.start:
-        return 0;
-      case CrossAxisAlignment.end:
-        return containerWidth - contentWidth;
-      case CrossAxisAlignment.center:
-        return (containerWidth - contentWidth) / 2;
-      default:
-        return 0;
+  @override
+  bool shouldRepaint(covariant LyricPainter oldDelegate) {
+    return shouldRepaintCommon(oldDelegate) ||
+        isSelecting != oldDelegate.isSelecting;
+  }
+}
+
+/// 逐字高亮层：只绘制当前播放行（以及退场行）的高亮。
+///
+/// 播放进度每帧更新只会重绘这一层，配合外层 RepaintBoundary
+/// 避免整屏文字与边缘遮罩被反复重绘。
+class LyricHighlightPainter extends _LyricPainterBase {
+  final double activeHighlightWidth;
+
+  LyricHighlightPainter({
+    required LyricLayout layout,
+    required int playIndex,
+    required double scrollY,
+    required LyricLineSwitchState switchState,
+    required LyricStyle style,
+    required this.activeHighlightWidth,
+  }) : super(
+          layout: layout,
+          playIndex: playIndex,
+          scrollY: scrollY,
+          switchState: switchState,
+          style: style,
+        );
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final layoutStyle = layout.style;
+    final metrics = layout.metrics;
+
+    canvas.clipRect(Rect.fromLTRB(-layoutStyle.contentPadding.left, 0,
+        size.width + layoutStyle.contentPadding.right, size.height));
+
+    if (metrics.isNotEmpty) {
+      final switchAnimationEnabled = style.enableSwitchAnimation == true;
+
+      // 当前播放行高亮
+      if (playIndex >= 0 && playIndex < metrics.length) {
+        final metric = metrics[playIndex];
+        var highlightOpacity = 1.0;
+        if (switchAnimationEnabled) {
+          if (playIndex == switchState.enterIndex) {
+            highlightOpacity = switchState.enterAnimationValue;
+          } else if (playIndex == switchState.exitIndex) {
+            highlightOpacity = 1.0 - switchState.exitAnimationValue;
+          }
+        }
+        _paintLineHighlight(
+          canvas,
+          size,
+          index: playIndex,
+          metric: metric,
+          maskPainter: metric.activeMaskPainter,
+          lineMetrics: metric.activeMetrics,
+          textPainter: metric.activeTextPainter,
+          highlightTotalWidth: metric.words?.isNotEmpty == true
+              ? activeHighlightWidth
+              : double.infinity,
+          animationOpacity: highlightOpacity,
+        );
+      }
+
+      // 行切换动画期间旧行的退场高亮
+      final exitIndex = switchState.exitIndex;
+      if (switchAnimationEnabled &&
+          exitIndex != playIndex &&
+          exitIndex >= 0 &&
+          exitIndex < metrics.length &&
+          switchState.exitAnimationValue < 1) {
+        final metric = metrics[exitIndex];
+        _paintLineHighlight(
+          canvas,
+          size,
+          index: exitIndex,
+          metric: metric,
+          maskPainter: metric.textMaskPainter,
+          lineMetrics: metric.metrics,
+          textPainter: metric.textPainter,
+          highlightTotalWidth: double.infinity,
+          animationOpacity: 1.0 - switchState.exitAnimationValue,
+        );
+      }
     }
   }
 
+  void _paintLineHighlight(
+    Canvas canvas,
+    Size size, {
+    required int index,
+    required LineMetrics metric,
+    required TextPainter maskPainter,
+    required List<ui.LineMetrics> lineMetrics,
+    required TextPainter textPainter,
+    required double highlightTotalWidth,
+    required double animationOpacity,
+  }) {
+    if (animationOpacity <= 0) return;
+    final originY = lineTopY(index);
+    final originX = calcContentAliginOffset(textPainter.width, size.width);
+    // 渐隐必须在屏幕坐标下应用：先判断该行是否落在渐隐带内，
+    // 落在其中时把高亮画进一个按行位置限定的小离屏层，
+    // 再把画布恢复到屏幕坐标做 dstOut 擦除。
+    final lineRect = Rect.fromLTWH(
+      0,
+      originY - 32,
+      size.width,
+      (metric.activeHeight > metric.height
+              ? metric.activeHeight
+              : metric.height) +
+          64,
+    ).intersect(Offset.zero & size);
+    final needsFade = hasEdgeFade && intersectsEdgeFade(lineRect, size);
+    canvas.save();
+    if (needsFade) {
+      canvas.saveLayer(lineRect, Paint());
+    }
+    canvas.save();
+    canvas.translate(0, originY);
+    canvas.translate(originX, 0);
+    handleSwitchAnimation(canvas, metric, index, switchState, textPainter, size);
+    drawHighlight(
+      canvas,
+      size,
+      maskPainter,
+      lineMetrics,
+      highlightTotalWidth: highlightTotalWidth,
+      animationOpacity: animationOpacity,
+    );
+    canvas.restore();
+    if (needsFade) {
+      paintEdgeFade(canvas, size);
+      canvas.restore();
+    }
+    canvas.restore();
+  }
+
   @override
-  bool shouldRepaint(covariant LyricPainter oldDelegate) {
-    final shouldRepaint = layout != oldDelegate.layout ||
-        playIndex != oldDelegate.playIndex ||
-        scrollY != oldDelegate.scrollY ||
-        activeHighlightWidth != oldDelegate.activeHighlightWidth ||
-        switchState != oldDelegate.switchState;
-    return shouldRepaint;
+  bool shouldRepaint(covariant LyricHighlightPainter oldDelegate) {
+    return shouldRepaintCommon(oldDelegate) ||
+        activeHighlightWidth != oldDelegate.activeHighlightWidth;
   }
 }
