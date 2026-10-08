@@ -40,22 +40,14 @@ mixin LyricLayoutMixin<T extends StatefulWidget> on State<T> {
       return;
     }
     if (comparison == RenderComparison.layout) {
+      LyricLayoutCache.invalidate();
       computeLyricLayout();
       return;
     }
     if (comparison == RenderComparison.paint) {
-      layout?.metrics.forEach((element) {
-        element.textPainter.text =
-            TextSpan(text: element.line.text, style: newStyle.textStyle);
-        element.activeTextPainter.text =
-            TextSpan(text: element.line.text, style: newStyle.activeStyle);
-        element.textMaskPainter.text = LyricLayout.buildHighlightMaskTextSpan(
-            element.textPainter.text! as TextSpan);
-        element.activeMaskPainter.text = LyricLayout.buildHighlightMaskTextSpan(
-            element.activeTextPainter.text! as TextSpan);
-        element.translationTextPainter.text = TextSpan(
-            text: element.line.translation, style: newStyle.translationStyle);
-      });
+      // 只更新已构建的 painter（颜色），未构建的高亮/遮罩保持懒构建
+      layout?.metrics.forEach((element) => element.applyStyle(newStyle));
+      LyricLayoutCache.invalidate();
       setState(() {});
     }
   }
@@ -84,6 +76,7 @@ mixin LyricLayoutMixin<T extends StatefulWidget> on State<T> {
 
   void systemFontsDidChange() {
     if (layout == null) return;
+    LyricLayoutCache.invalidate();
     onLayoutChange(LyricLayout.updatePainters(layout!));
   }
 
@@ -96,17 +89,26 @@ mixin LyricLayoutMixin<T extends StatefulWidget> on State<T> {
     }
   }
 
-  /// 计算歌词布局
+  /// 计算歌词布局（命中 [LyricLayoutCache] 时直接复用，不再逐行测量）
   void computeLyricLayout() {
     final lyricModel = controller.lyricNotifier.value;
     if (lyricModel == null) {
       return;
     }
-    final computedLayout = LyricLayout.compute(
-      lyricModel,
-      style,
-      lyricSize,
-    );
+    // 尺寸未就绪时不计算：maxWidth 为 0 会让每个字各占一行
+    if (lyricSize.isEmpty) {
+      return;
+    }
+    LyricLayout? computedLayout =
+        LyricLayoutCache.lookup(lyricModel, style, lyricSize);
+    if (computedLayout == null) {
+      computedLayout = LyricLayout.compute(
+        lyricModel,
+        style,
+        lyricSize,
+      );
+      LyricLayoutCache.store(lyricModel, lyricSize, computedLayout);
+    }
     controller.anchorPositionNotifier.value =
         computedLayout.selectionAnchorPosition;
     onLayoutChange(computedLayout);

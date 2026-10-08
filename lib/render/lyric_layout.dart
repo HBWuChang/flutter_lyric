@@ -3,6 +3,9 @@ import 'package:flutter_lyric/core/lyric_model.dart';
 import 'package:flutter_lyric/core/lyric_style.dart';
 
 class LyricLayout {
+  /// 调试用：真正执行布局计算的次数（缓存命中不计数）
+  static int debugComputeCount = 0;
+
   final List<LineMetrics> metrics;
   final LyricStyle style;
   final Size viewSize;
@@ -111,40 +114,40 @@ class LyricLayout {
     this.activeAnchorPosition,
   );
 
+  /// 系统字体变化后重新测量「普通文本」。
+  ///
+  /// 高亮 / 遮罩度量保持懒构建，这里直接丢弃旧缓存，绘制时按新字体重建。
   factory LyricLayout.updatePainters(
     LyricLayout layout,
   ) {
+    final maxWidth = layout.viewSize.width;
     final lineMetrics = <LineMetrics>[];
     for (var line in layout.metrics) {
-      line.textPainter.markNeedsLayout();
-      line.activeTextPainter.markNeedsLayout();
-      line.textMaskPainter.markNeedsLayout();
-      line.activeMaskPainter.markNeedsLayout();
-      line.translationTextPainter.markNeedsLayout();
-      line.textPainter.layout(maxWidth: layout.viewSize.width);
-      line.activeTextPainter.layout(maxWidth: layout.viewSize.width);
-      line.textMaskPainter.layout(maxWidth: layout.viewSize.width);
-      line.activeMaskPainter.layout(maxWidth: layout.viewSize.width);
-      final hasTranslation = line.translationTextPainter.text != null;
+      final textPainter = line.textPainter;
+      textPainter.markNeedsLayout();
+      textPainter.layout(maxWidth: maxWidth);
+      final translationTextPainter = line.translationTextPainter;
+      final hasTranslation = translationTextPainter.text != null;
       if (hasTranslation) {
-        line.translationTextPainter.layout(maxWidth: layout.viewSize.width);
+        translationTextPainter.markNeedsLayout();
+        translationTextPainter.layout(maxWidth: maxWidth);
       }
-      line.words;
-      final words = _calcWordMetrics(line.line, line.textPainter,
-          line.activeTextPainter, line.translationTextPainter);
-      lineMetrics.add(line.copyWith(
-        height: line.textPainter.height,
-        width: line.textPainter.width,
-        activeWidth: line.activeTextPainter.width,
-        activeHeight: line.activeTextPainter.height,
-        translationWidth:
-            hasTranslation ? line.translationTextPainter.width : 0,
-        translationHeight:
-            hasTranslation ? line.translationTextPainter.height : 0,
-        activeMetrics: line.activeTextPainter.computeLineMetrics(),
-        metrics: line.textPainter.computeLineMetrics(),
-        words: words,
-      ));
+      final updated = LineMetrics(
+        line: line.line,
+        height: textPainter.height,
+        width: textPainter.width,
+        translationWidth: hasTranslation ? translationTextPainter.width : 0,
+        translationHeight: hasTranslation ? translationTextPainter.height : 0,
+        textPainter: textPainter,
+        translationTextPainter: translationTextPainter,
+        maxWidth: maxWidth,
+        style: layout.style,
+      );
+      if (line.line.words != null) {
+        updated.words = _calcWordMetrics(line.line, textPainter,
+            updated.activeTextPainter, translationTextPainter);
+      }
+      lineMetrics.add(updated);
     }
     return LyricLayout._internal(
       lineMetrics,
@@ -244,11 +247,17 @@ class LyricLayout {
     return words;
   }
 
+  /// 计算整首歌词的布局。
+  ///
+  /// 每行只 eager 测量「普通文本」（绘制任意行都要用），高亮样式与遮罩
+  /// 交给 [LineMetrics] 懒构建：只有当前播放行 / 进退场行才会真正用到，
+  /// 这样长歌词的首帧布局耗时可以降到原来的 1/3 左右。
   factory LyricLayout.compute(
     LyricModel model,
     LyricStyle style,
     Size viewSize,
   ) {
+    debugComputeCount++;
     final maxWidth = viewSize.width;
     final lineMetrics = <LineMetrics>[];
     for (var line in model.lines) {
@@ -256,31 +265,13 @@ class LyricLayout {
         textAlign: style.lineTextAlign,
         textDirection: TextDirection.ltr,
       );
-      final activeTextPainter = TextPainter(
-        textAlign: style.lineTextAlign,
-        textDirection: TextDirection.ltr,
-      );
+      textPainter.text = TextSpan(text: line.text, style: style.textStyle);
+      textPainter.layout(maxWidth: maxWidth);
+
       final translationTextPainter = TextPainter(
         textAlign: style.lineTextAlign,
         textDirection: TextDirection.ltr,
       );
-      textPainter.text = TextSpan(text: line.text, style: style.textStyle);
-      textPainter.layout(maxWidth: maxWidth);
-
-      final metrics = textPainter.computeLineMetrics();
-      final height = textPainter.height;
-      final width = textPainter.width;
-
-      activeTextPainter.text =
-          TextSpan(text: line.text, style: style.activeStyle);
-      activeTextPainter.layout(maxWidth: maxWidth);
-      final activceLineMetrics = activeTextPainter.computeLineMetrics();
-      final highlightWidth = activeTextPainter.width;
-      final highlightHeight = activeTextPainter.height;
-      final textMaskPainter = createHighlightMaskPainter(textPainter, maxWidth);
-      final activeMaskPainter =
-          createHighlightMaskPainter(activeTextPainter, maxWidth);
-
       double translationWidth = 0;
       double translationHeight = 0;
 
@@ -293,27 +284,23 @@ class LyricLayout {
         translationWidth = translationTextPainter.width;
         translationHeight = translationTextPainter.height;
       }
-      final words = _calcWordMetrics(
-          line, textPainter, activeTextPainter, translationTextPainter);
-      lineMetrics.add(
-        LineMetrics(
-          line: line,
-          height: height,
-          width: width,
-          activeWidth: highlightWidth,
-          activeHeight: highlightHeight,
-          translationWidth: translationWidth,
-          translationHeight: translationHeight,
-          activeMetrics: activceLineMetrics,
-          metrics: metrics,
-          words: words,
-          textPainter: textPainter,
-          activeTextPainter: activeTextPainter,
-          textMaskPainter: textMaskPainter,
-          activeMaskPainter: activeMaskPainter,
-          translationTextPainter: translationTextPainter,
-        ),
+      final lineMetric = LineMetrics(
+        line: line,
+        height: textPainter.height,
+        width: textPainter.width,
+        translationWidth: translationWidth,
+        translationHeight: translationHeight,
+        textPainter: textPainter,
+        translationTextPainter: translationTextPainter,
+        maxWidth: maxWidth,
+        style: style,
       );
+      if (line.words != null) {
+        lineMetric.words = _calcWordMetrics(
+            line, textPainter, lineMetric.activeTextPainter,
+            translationTextPainter);
+      }
+      lineMetrics.add(lineMetric);
     }
     return LyricLayout._internal(
       lineMetrics,
@@ -323,4 +310,74 @@ class LyricLayout {
       style.calcActiveAnchorPosition(viewSize.height),
     );
   }
+}
+
+class _CachedLayout {
+  _CachedLayout(this.model, this.viewSize, this.layout);
+
+  final LyricModel model;
+  final Size viewSize;
+  final LyricLayout layout;
+}
+
+/// 歌词布局缓存。
+///
+/// 整首歌词的布局（每行至少一次 TextPainter.layout）是歌词页首帧的主要开销，
+/// 但 widget 重建（`Visibility` 切换、页面重新进入、外层 setState）并不会
+/// 改变歌词模型或尺寸，此时完全可以复用上一次的布局。
+///
+/// 命中条件：同一个 [LyricModel] 实例 + 相同的 viewSize + 等价样式；
+/// 未命中（换歌、改字号、改行距）时才真正执行 [LyricLayout.compute]。
+class LyricLayoutCache {
+  LyricLayoutCache._();
+
+  /// 最多缓存几份布局（约等于最近听过的几首歌），超出后按 LRU 淘汰
+  static const int _maxEntries = 3;
+
+  static final List<_CachedLayout> _entries = <_CachedLayout>[];
+
+  /// 命中则返回缓存布局；样式实例不同但等价时会返回替换样式后的副本。
+  static LyricLayout? lookup(
+    LyricModel model,
+    LyricStyle style,
+    Size viewSize,
+  ) {
+    for (var i = _entries.length - 1; i >= 0; i--) {
+      final entry = _entries[i];
+      if (!identical(entry.model, model)) continue;
+      if (entry.viewSize != viewSize) continue;
+      final cachedStyle = entry.layout.style;
+      if (!identical(cachedStyle, style) &&
+          cachedStyle.compareTo(style) != RenderComparison.identical) {
+        continue;
+      }
+      // LRU：命中后移到队尾
+      _entries.removeAt(i);
+      _entries.add(entry);
+      return identical(cachedStyle, style)
+          ? entry.layout
+          : entry.layout.copyWith(style);
+    }
+    return null;
+  }
+
+  /// 保存一份布局
+  static void store(LyricModel model, Size viewSize, LyricLayout layout) {
+    _entries.removeWhere(
+      (entry) => identical(entry.model, model) && entry.viewSize == viewSize,
+    );
+    _entries.add(_CachedLayout(model, viewSize, layout));
+    while (_entries.length > _maxEntries) {
+      _entries.removeAt(0);
+    }
+  }
+
+  /// 布局中的 painter 被就地修改（样式变化、系统字体变化）时调用。
+  /// 否则其他视图可能复用到与缓存样式不一致的 painter。
+  static void invalidate() {
+    _entries.clear();
+  }
+
+  /// 当前缓存的布局数量
+  static int get length => _entries.length;
 }
